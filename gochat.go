@@ -1,97 +1,123 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"log"
-	"net"
+	"net/http"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
+
 )
 
-type client struct {
-	conn net.Conn
+type Client struct {
+	conn *websocket.Conn
+	send chan []byte
 	name string
 }
 
-type hub struct {
+type Hub struct {
 	lock    sync.Mutex
-	clients map[*client]bool
+	clients map[*Client]bool
 }
 
-func newHub() *hub {
-	return &hub{clients: make(map[*client]bool)}
+func newHub() *Hub {
+	return &Hub{clients: make(map[*Client]bool)}
 }
 
-func (hub *hub) addClient(c *client) {
-	hub.lock.Lock()
-	defer hub.lock.Unlock()
-	hub.clients[c] = true
+func (h *Hub) addClient(c *Client) {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	h.clients[c] = true
 }
 
-func (hub *hub) removeClient(c *client) {
-	hub.lock.Lock()
-	defer hub.lock.Unlock()
-	delete(hub.clients, c)
+func (h *Hub) removeClient(c *Client) {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	if _, ok := h.clients[c]; ok {
+		delete(h.clients, c)
+		close(c.send)
+	}
 }
 
-func (hub *hub) broadcast(msg string, sender *client) {
+func (h *Hub) broadcast(msg []byte, c *Client) {
 	timestamp := time.Now().Format(time.RFC3339)
-	msg = fmt.Sprintf("[%s] %s", timestamp, msg)
-	hub.lock.Lock()
-	defer hub.lock.Unlock()
-	for c := range hub.clients {
-		fmt.Fprintln(c.conn, msg)
+	msg = []byte(fmt.Sprintf("[%s] %s", timestamp, msg))
+
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	for c := range h.clients {
+		c.send <- msg
 	}
 }
 
-func handleConnection(conn net.Conn, hub *hub) {
-	defer conn.Close()
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	// Allow all origins for local dev. Lock this down in production.
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
 
-	client := &client{conn: conn}
-
-	fmt.Fprint(conn, "Enter your name: ")
-	scanner := bufio.NewScanner(conn)
-	if !scanner.Scan() {
-		return
-	}
-	client.name = scanner.Text()
-
-	hub.addClient(client)
-	hub.broadcast(fmt.Sprintf("* %s has joined the chat *", client.name), client)
+// readPump reads messages from the browser and broadcasts them
+func (c *Client) readPump(h *Hub) {
 	defer func() {
-		hub.removeClient(client)
-		hub.broadcast(fmt.Sprintf("* %s has left the chat *", client.name), client)
+		h.removeClient(c)
+		c.conn.Close()
+		h.broadcast([]byte(c.name+" has left the chat"), c)
 	}()
 
-	for scanner.Scan() {
-		text := scanner.Text()
-		msg := fmt.Sprintf("%s: %s", client.name, text)
-		log.Println(msg)
-		hub.broadcast(msg, client)
+	for {
+		_, msg, err := c.conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		full := []byte(c.name + ": " + string(msg))
+		log.Println(string(full))
+		h.broadcast(full, c)
+	}
+}
+
+// writePump pushes queued messages out to the browser
+func (c *Client) writePump() {
+	defer c.conn.Close()
+	for msg := range c.send {
+		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			break
+		}
+	}
+}
+
+func serveWs(h *Hub, w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("upgrade error:", err)
+		return
 	}
 
-	if err := scanner.Err(); err != nil {
-		log.Printf("connection error for %s: %v", client.name, err)
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		name = "anonymous"
 	}
+
+	client := &Client{conn: conn, send: make(chan []byte, 16), name: name}
+	h.addClient(client)
+	h.broadcast([]byte(name+" has joined the chat"), client)
+
+	go client.writePump()
+	client.readPump(h)
 }
 
 func main() {
-	listener, err := net.Listen("tcp", "localhost:9000")
-	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
-	}
-	defer listener.Close()
-	log.Println("chat server listening on :9000")
+	h := newHub()
 
-	hub := newHub()
+	http.Handle("/", http.FileServer(http.Dir("./static")))
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		serveWs(h, w, r)
+	})
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("accept error: %v", err)
-			continue
-		}
-		go handleConnection(conn, hub)
+	log.Println("server listening on :8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatal(err)
 	}
 }

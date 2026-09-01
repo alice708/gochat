@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Go Chat</title>
+</head>
+<body>
+  <div id="messages" style="height:300px; overflow-y:scroll; border:1px solid #ccc;"></div>
+  <input id="input" placeholder="Type a message..." />
+  <button id="send">Send</button>
+
+  <script>
+    const name = prompt("Enter your name:") || "anonymous";
+    const ws = new WebSocket(`ws://${location.host}/ws?name=${encodeURIComponent(name)}`);
+    const messagesDiv = document.getElementById("messages");
+    const input = document.getElementById("input");
+
+    ws.onmessage = (event) => {
+      const p = document.createElement("p");
+      p.textContent = event.data;
+      messagesDiv.appendChild(p);
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    };
+
+    ws.onopen = () => console.log("connected");
+    ws.onclose = () => {
+      const p = document.createElement("p");
+      p.textContent = "-- disconnected --";
+      messagesDiv.appendChild(p);
+    };
+
+    function sendMessage() {
+      if (input.value.trim() === "") return;
+      ws.send(input.value);
+      input.value = "";
+    }
+
+    document.getElementById("send").onclick = sendMessage;
+    input.addEventListener("keypress", (e) => {
+      if (e.key === "Enter") sendMessage();
+    });
+  </script>
+</body>
+</html>
